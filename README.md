@@ -1,5 +1,7 @@
 # pdfindex2md
 
+[![selftest](https://github.com/skurtz97/pdfindex2md/actions/workflows/selftest.yml/badge.svg)](https://github.com/skurtz97/pdfindex2md/actions/workflows/selftest.yml)
+
 Turn an Adobe-indexed PDF package into one Markdown file and one plain-text
 file per document, plus an index you can grep.
 
