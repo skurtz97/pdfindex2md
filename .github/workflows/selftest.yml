@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Naming rules
-        run: python3 pdfindex2md --selftest
+        run: make check
       - name: Compiles
         run: python3 -m py_compile pdfindex2md
       - name: Usage renders

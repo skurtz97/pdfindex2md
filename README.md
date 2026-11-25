@@ -80,16 +80,48 @@ sudo dnf install poppler-utils python3-beautifulsoup4 python3-lxml python3-pypdf
 
 ## Install
 
-It is a single script with no imports outside the standard library, so a copy
-in your `PATH` is the whole installation:
+It is a single script with no imports outside the standard library, so
+installing means putting one file in a directory on your `PATH`. There is
+nothing to compile and nothing to configure.
+
+From a release tarball (swap `1.1.0` for whichever release you want):
+
+```sh
+curl -LO https://github.com/skurtz97/pdfindex2md/releases/download/v1.1.0/pdfindex2md-1.1.0.tar.gz
+tar xzf pdfindex2md-1.1.0.tar.gz
+cd pdfindex2md-1.1.0
+make install
+```
+
+Or from a clone:
 
 ```sh
 git clone https://github.com/skurtz97/pdfindex2md.git
-install -m 755 pdfindex2md/pdfindex2md ~/.local/bin/pdfindex2md
+cd pdfindex2md
+make install
 ```
 
-Keep the file extensionless if you install it that way; `argv[0]` is then the
-command name and the `#!` line finds Python.
+`make install` copies `pdfindex2md` to `$(PREFIX)/bin` with mode 755, and
+`PREFIX` defaults to `$(HOME)/.local`, so it lands in `~/.local/bin` for a
+single-user install and in `/usr/local/bin` with `sudo make install
+PREFIX=/usr/local`. `DESTDIR` works the usual way for staging.
+
+| command | what it does |
+|---------|--------------|
+| `make install` | copy the script into `$(DESTDIR)$(PREFIX)/bin` |
+| `make uninstall` | remove it again |
+| `make check` | run the naming selftest — the same thing CI runs |
+| `make clean` | remove `__pycache__` |
+
+Without make, the install is this one line:
+
+```sh
+install -m 755 pdfindex2md ~/.local/bin/pdfindex2md
+```
+
+Keep the file extensionless: the `#!` line then finds Python and `argv[0]` is
+the command name. If you keep it in a clone instead of copying it, a symlink
+into your `PATH` works too.
 
 ## Usage
 
