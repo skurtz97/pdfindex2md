@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+r"""Convert an Adobe-indexed PDF package into per-document Markdown and text.
+
+    pdfindex2md ~/docs/mainframe/zOS320-Indexed-PDF-package-\(2026-07-31\)
+
+Reads the package's own TOC (the only .htm beside the PDFs) for each document's
+title and order number, then writes:
+
+    <pkg>/md/<title-slug>-<docid>.md
+    <pkg>/txt/<title-slug>-<docid>.txt
+    <pkg>/INDEX.md      the index, linked to both, in the TOC's own order
+    <pkg>/index.txt     the same index as plain text, for grep
+
+The TOC .htm and the PDFs are never touched, so the package still opens and
+bookmarks in a browser exactly as before. <docid> is the PDF's own name
+(izsc200_v3r2), dropped when the title already spells it out.
+
+Needs pdftotext (poppler). pypdfium2 is optional: it supplies the PDF bookmarks,
+which become the Markdown headings; without it the Markdown is flat text.
+bs4+lxml parse the TOC.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from unicodedata import normalize
+
+EXCLUDED_HEADS = {"order number", "filename"}
+
+
+def slug(s):
+    s = normalize("NFKD", s).encode("ascii", "ignore").decode()
+    return re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", s.lower())).strip("-")
+
+
+def doc_name(title, pdf):
+    """<title-slug> plus the document id, unless the title repeats it."""
+    stem = re.sub(r"[^a-z0-9_.-]+", "-", Path(pdf).stem.lower())
+    t = slug(title)[:100].strip("-")
+    if not t:
+        return stem
+    return t if slug(stem) in t else f"{t}-{stem}"
+
+
+def parse_toc(htm):
+    """(category, title, order number, pdf) per document, in the TOC's order.
+
+    Word's HTML nests whole sub-tables inside one <tr>, so walk <td> cells and
+    take the two non-empty texts before each PDF link: order number, then title.
+    A cell reading "Order number" starts a new category.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(htm.read_text(encoding="cp1252", errors="replace"), "lxml")
+    cells, seen = [], set()
+
+    def flatten(node):
+        for td in node.find_all("td"):
+            if id(td) in seen:
+                continue
+            seen.add(id(td))
+            links = td.find_all("a", href=re.compile(r"\.pdf$", re.I))
+            if len(links) > 1:  # the whole table nested in one cell; walk inwards
+                flatten(td)
+                continue
+            cells.append((" ".join(td.get_text(" ", strip=True).split()),
+                          links[0]["href"] if links else None))
+
+    flatten(soup)
+
+    entries, cat, recent = [], "Uncategorized", []
+    for text, pdf in cells:
+        if pdf:
+            texts = [t for t in recent if t]
+            order = texts[-1] if texts else ""
+            title = texts[-2] if len(texts) > 1 else Path(pdf).stem
+            if len(title) > 120:
+                title = Path(pdf).stem
+            if not any(e[3] == pdf for e in entries):
+                entries.append((cat, title, order, pdf))
+            recent = []
+        elif text.lower() == "order number":
+            texts = [t for t in recent if t and len(t) < 60]
+            if texts:
+                cat = " / ".join(texts[-2:])
+            recent = []
+        elif text.lower() != "filename":
+            recent.append(text)
+    return entries
+
+
+def pdf_text(path):
+    out = subprocess.run(
+        ["pdftotext", "-layout", "-enc", "UTF-8", str(path), "-"],
+        capture_output=True, check=True,
+    ).stdout
+    pages = out.decode("utf-8", "replace").split("\f")
+    if pages and not pages[-1].strip():
+        pages.pop()
+    return pages
+
+
+def bookmarks(path):
+    """{page index: [(level, title)]} from the PDF outline; {} without pypdfium2."""
+    try:
+        import pypdfium2
+    except ImportError:
+        return {}
+    heads = {}
+    with pypdfium2.PdfDocument(str(path)) as doc:
+        for bm in doc.get_toc():
+            title = re.sub(r"\s+", " ", bm.get_title().replace("\xa0", " ")).strip()
+            dest = bm.get_dest()
+            if dest is None:  # a bookmark with no target page
+                continue
+            heads.setdefault(dest.get_index(), []).append((bm.level, title))
+    return heads
+
+
+def body_lines(pages):
+    """Page lines with the running header/footer and bare page numbers dropped."""
+    def key(line):
+        return re.sub(r"\d+", "#", re.sub(r"\s+", " ", line.strip().lower()))
+
+    lines = [[l for l in p.splitlines() if l.strip()] for p in pages]
+    seen = {}
+    for pl in lines:
+        for l in set(pl[:2] + pl[-2:]):
+            seen[key(l)] = seen.get(key(l), 0) + 1
+    recurring = {k for k, n in seen.items() if n >= max(3, len(pages) // 3)}
+    kept = []
+    for pl in lines:
+        edge = set(range(min(2, len(pl)))) | set(range(max(0, len(pl) - 2), len(pl)))
+        kept.append([
+            l for i, l in enumerate(pl)
+            if not (i in edge and (key(l) in recurring
+                                  or re.fullmatch(r"[ivxlcdm\d]+", l.strip().lower())))
+        ])
+    return kept
+
+
+def convert(job):
+    try:
+        return _convert(job)
+    except Exception as e:  # one unreadable PDF must not stop the batch
+        return job[3], 0, f"FAILED {e}"
+
+
+def _convert(job):
+    path, title, order, name, md_dir, txt_dir, force = job
+    md_path, txt_path = md_dir / f"{name}.md", txt_dir / f"{name}.txt"
+    if not force and txt_path.exists() and md_path.exists():
+        return name, 0, "skipped"
+    pages = pdf_text(path)
+    txt_path.write_text(
+        f"{title}\n{order + '\n' if order else ''}source: {path.name}\n\n"
+        + "\f\n".join(pages), encoding="utf-8")
+    heads = bookmarks(path)
+    out = [f"# {title}", ""]
+    if order:
+        out.append(f"- Order number: {order}")
+    out += [f"- Source: `{path.name}` ({len(pages)} pages)", ""]
+    for i, lines in enumerate(body_lines(pages)):
+        out.append(f"<!-- page {i + 1} -->")
+        for level, h in heads.get(i, []):
+            out += ["", "#" * min(level + 2, 6) + " " + h, ""]
+        out += lines + [""]
+    md_path.write_text("\n".join(out), encoding="utf-8")
+    return name, len(pages), "ok"
+
+
+def selftest():
+    assert slug("Cascading FlashCopy") == "cascading-flashcopy"
+    assert slug("JES2 Small Environment and NOTIFY enhancements") == \
+        "jes2-small-environment-and-notify-enhancements"
+    assert doc_name("Cascading FlashCopy", "izsc200_v3r2.pdf") == \
+        "cascading-flashcopy-izsc200_v3r2"
+    assert len(doc_name("Title " * 60, "x.pdf")) < 255
+    # Title-stem files must not repeat the title in the name.
+    assert doc_name("A Guide to Understaning AFP Fonts",
+                    "A-Guide-to-Understaning-AFP-Fonts.pdf") == \
+        "a-guide-to-understaning-afp-fonts"
+    assert doc_name("", "i1330093.pdf") == "i1330093"
+    print("selftest ok")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("package", nargs="?", help="directory holding the TOC .htm and the PDFs")
+    ap.add_argument("-j", "--jobs", type=int, default=8, help="parallel converters (default 8)")
+    ap.add_argument("--limit", type=int, help="convert only N documents (testing)")
+    ap.add_argument("--force", action="store_true", help="reconvert documents already written")
+    ap.add_argument("--selftest", action="store_true", help="check naming and exit")
+    args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    if not args.package:
+        ap.error("package directory is required")
+
+    pkg = Path(args.package).expanduser().resolve()
+    tocs = sorted(pkg.glob("*.htm")) + sorted(pkg.glob("*.html"))
+    if not tocs:
+        sys.exit(f"no TOC .htm in {pkg}")
+    toc = tocs[0]
+    entries = parse_toc(toc)
+    indexed = {e[3] for e in entries}
+    # PDFs the TOC forgot still deserve text; list them at the end.
+    for pdf in sorted(p.name for p in pkg.glob("*.pdf")):
+        if pdf not in indexed:
+            entries.append(("Not in the index", Path(pdf).stem, "", pdf))
+    if args.limit:
+        entries = entries[: args.limit]
+
+    md_dir, txt_dir = pkg / "md", pkg / "txt"
+    md_dir.mkdir(exist_ok=True)
+    txt_dir.mkdir(exist_ok=True)
+
+    jobs, names, missing = [], [], []
+    for cat, title, order, pdf in entries:
+        if not (pkg / pdf).exists():
+            missing.append((cat, title, order, pdf))
+            continue
+        name = doc_name(title, pdf)
+        while name in names:
+            name += "-2"
+        names.append(name)
+        jobs.append((pkg / pdf, title, order, name, md_dir, txt_dir, args.force))
+
+    done = 0
+    with ProcessPoolExecutor(args.jobs) as pool:
+        for name, pages, status in pool.map(convert, jobs):
+            done += 1
+            print(f"[{done:3d}/{len(jobs)}] {status:7s} {name}"
+                  + (f" ({pages}p)" if pages else ""), flush=True)
+
+    for cat, title, order, pdf in missing:
+        print(f"missing  {pdf} ({title})", flush=True)
+    rows = [
+        "# z/OS documentation, converted to Markdown and text", "",
+        f"Index of `{pkg.name}`, generated by pdfindex2md from "
+        f"[{toc.name}]({toc.name}). The original index and the PDFs are unchanged.", "",
+        f"{len(jobs)} documents: Markdown in [md/](md), plain text in [txt/](txt).", "",
+        *([f"The TOC links {len(missing)} PDFs that are not in the package: "
+           + ", ".join(f"`{m[3]}`" for m in missing), ""] if missing else []),
+    ]
+    flat = [f"converted from {toc.name}", ""]
+    cat = None
+    for (ecat, title, order, pdf), name in zip([e for e in entries if (pkg / e[3]).exists()], names):
+        if ecat != cat:
+            cat = ecat
+            rows += [f"## {cat}", "",
+                     "| Title | Order number | PDF | Text | Markdown |",
+                     "|-------|--------------|-----|------|----------|"]
+            flat += [f"== {cat} =="]
+        rows.append(f"| {title} | {order} | [{pdf}]({pdf}) | "
+                    f"[txt](txt/{name}.txt) | [md](md/{name}.md) |")
+        flat.append(f"{title} | {order} | {pdf} | txt/{name}.txt | md/{name}.md")
+    rows += ["", "---", "", "Generated with pdfindex2md.", ""]
+    (pkg / "INDEX.md").write_text("\n".join(rows), encoding="utf-8")
+    (pkg / "index.txt").write_text("\n".join(flat) + "\n", encoding="utf-8")
+    print(f"wrote {pkg / 'INDEX.md'} and {pkg / 'index.txt'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
